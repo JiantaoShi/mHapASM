@@ -205,8 +205,10 @@ object (as in `mHapDMR::build_bsseq_mscore`) with a `~ sample + allele` design.
 The read-level rules (allele call, methylation call, mate merging) follow
 `snp_patter`, `patter` and `match_maker` of
 [wgbs_tools](https://github.com/nloyfer/wgbs_tools) (Loyfer *et al.*,
-*Life Science Alliance* 9(4): e202503514, 2026), which also provides the
-tutorial BAM in `test/data`. Aligner strand tags are handled as in
+*Life Science Alliance* 9(4): e202503514, 2026). The tutorial BAM in
+`test/data` comes from wgbs_tools; for these data cite Loyfer *et al.*,
+[A DNA methylation atlas of normal human cell types](https://doi.org/10.1038/s41586-022-05580-6),
+*Nature* 613: 355–364 (2023). Aligner strand tags are handled as in
 [mhapx](https://github.com/BestRivenWR/mhapx). The M-score statistics are
 those of [mHapDMR](https://github.com/JiantaoShi/mHapDMR) and
 [MscoreDMR](https://github.com/JiantaoShi/MscoreDMR).
