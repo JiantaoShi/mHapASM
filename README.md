@@ -212,3 +212,7 @@ The read-level rules (allele call, methylation call, mate merging) follow
 [mhapx](https://github.com/BestRivenWR/mhapx). The M-score statistics are
 those of [mHapDMR](https://github.com/JiantaoShi/mHapDMR) and
 [MscoreDMR](https://github.com/JiantaoShi/MscoreDMR).
+
+## License
+
+MIT, see [LICENSE](LICENSE).
