@@ -1,0 +1,14 @@
+# build
+mhapasm
+mhapasm.dSYM/
+*.o
+
+# test outputs
+test/out/
+
+# local data, not tracked
+BAM/
+CpG/
+output/
+
+.DS_Store
