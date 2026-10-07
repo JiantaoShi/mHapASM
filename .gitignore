@@ -3,6 +3,8 @@ mhapasm
 mhapasm.dSYM/
 mhapconvert
 mhapconvert.dSYM/
+mhapmscore
+mhapmscore.dSYM/
 *.o
 
 # test outputs

@@ -14,6 +14,9 @@ fragments, and calls CpGs with the rules of
   rewrite of `mhaptools convert` ([mHapTools](https://github.com/butyuhao/mHapTools))
   that handles soft clips and indels, the strand tags of Bismark, bwa-meth,
   BISCUIT and BSMAP, and non-directional libraries.
+* **`mhapmscore`**: M-score statistics from an mHap file, for every CpG (the
+  statistics of `mhapasm` over the reads that span it) or for given regions,
+  as mHapDMR computes them.
 
 ## Build
 
@@ -267,6 +270,76 @@ table comes from `test/compare_mhaptools.py BAM mhaptools.rec
 mhapconvert.qname.mhap.gz mhapconvert.nofilter.qname.mhap.gz` (the last made
 with `--max-unconv -1`).
 
+## mhapmscore
+
+```bash
+mhapmscore -i sample.mhap.gz -c hg38_CpG.gz -o sample.mscore.tsv.gz        # per CpG
+mhapmscore -i sample.mhap.gz -c hg38_CpG.gz -R dmrs.bed -o sample.dmrs.tsv  # per region
+```
+
+M-score statistics from an mHap file (from `mhapconvert`, `mhaptools convert`
+or any other source), per CpG or per region. Every mHap record is a read
+covering consecutive CpGs. A read *t*, seen *c_t* times (the count column),
+contributes *N_t* CpGs and *Z_t* = 1 if any of them is methylated, and the
+reads are summarised with the statistics of `mhapasm`:
+
+* **per CpG** (default): the reads whose haplotype spans the CpG, with *N_t*
+  over all CpGs of the read, or with `-w` over those within INT bp of the CpG;
+* **per region** (`-R`): the reads with CpGs in the region, with *N_t* over
+  those CpGs, as in mHapDMR's `mscore_region_stats`.
+
+| Option | Default | Meaning |
+|---|---|---|
+| `-i FILE` | | mHap file, plain or bgzipped. The records of a contig must be together, in any order; `-r` and `-b` need a tabix index. |
+| `-c FILE` | | CpG file used to make the mHap file, bgzipped and tabix-indexed. |
+| `-r STR` | | Only CpGs in this region (`chr:beg-end`). |
+| `-b FILE` | | Only CpGs in these BED regions. |
+| `-w INT` | 0 | *N_t* and *Z_t* from the CpGs of the read within INT bp of the CpG; 0 = all CpGs of the read. |
+| `-m INT` | 1 | Report CpGs spanned by at least INT reads. |
+| `-R FILE` | | Statistics of each region of this BED file instead of each CpG; needs a tabix index of the mHap file. |
+| `-o FILE` | stdout | Output; bgzipped and tabix-indexed (`-s1 -b2 -e2`) if the name ends in `.gz`. |
+| `--no-index` | | Do not write the tabix index. |
+| `-@ INT` | 0 | Extra threads for decompression and compression. |
+
+Output, one line per CpG (1-based position) after a `#` header line:
+
+```
+#chr    pos      reads  Nsum  N2sum  Sjd  mscore    kappa    Y_prime
+chr11   2018724  4      15    57     11   0.733333  3.94737  2.89474
+chr11   2018741  11     38    136    28   0.736842  10.6176  7.82353
+```
+
+`reads` = Σ *c_t*, `Nsum` = Σ *c_t N_t*, `N2sum` = Σ *c_t N_t*², `Sjd` =
+Σ *c_t N_t Z_t*, `mscore` = `Sjd / Nsum`, `kappa` = `Nsum² / N2sum` and
+`Y_prime` = `Sjd * Nsum / N2sum`, as in the `mhapasm` table above. With a
+window, the statistics of a CpG are those mHapDMR computes for the region
+[pos − w, pos + w] from the reads that span the CpG.
+
+With `-R`, every BED line gets one output line, in input order: `chr start
+end` as in the BED file, then the same seven columns. A region without reads
+has zeros and `NA`; lines that are not regions (a column header, for
+instance) are skipped with a message. A `.gz` output is tabix-indexed only if
+the BED file is sorted by position.
+
+```
+#chr    start   end     reads  Nsum   N2sum   Sjd   mscore    kappa    Y_prime
+chrS    3000    5000    1249   10278  112236  7523  0.731952  941.207  688.918
+chrS    3014    3015    0      0      0       0     NA        NA       NA
+```
+
+A record is used only if the CpG file has as many CpGs in [start, end] as its
+haplotype has states (the rule of mHapDMR and MscoreDMR). Other records are
+counted and skipped, with a warning when they exceed 1% (a different CpG file
+or genome build).
+
+mHapDMR before version 0.1.1 looked CpGs up only within `margin` bp of the
+region (150 by default), so `mscore_region_stats()` dropped every read with a
+CpG farther outside, which then failed this check: 25 of 150 ESCC DMRs (reads
+up to 233 bp) lost 2 to 4 reads each (M-score change up to 0.02), and 114 of
+126 regions of the simulated paired-end data (records up to 340 bp) lost 1.3%
+of their reads. mHapDMR 0.1.1 looks CpGs up over the full span of the reads,
+like `mhapmscore`, and gives the same results (see Validation).
+
 ## How reads are processed
 
 Shared by both tools (`src/bsread.c`):
@@ -311,6 +384,22 @@ pairs the results are identical to wgbs_tools.
   identically and only fragments with such a gap are dropped. A per-read
   emulation of `mhaptools convert` used for the comparisons above reproduces
   its output exactly on all these data sets.
+* `mhapmscore`: `test/check_mscore.R` recomputes every CpG in R from (read,
+  CpG) pairs and passes the records spanning each CpG to mHapDMR's
+  `.mscore_streaming` with the region [pos − w, pos + w] (the whole read for
+  w = 0). The results are identical on the IGF2 and simulated mHap files
+  (windows 0 to 500, also with records that do not match the CpG file) and on
+  chr21 of an ESCC WGBS sample (1.23M records; all 373,647 CpGs, 2,000 of them
+  also through mHapDMR; windows 0 and 150). With `-r` and `-b` the output
+  equals the corresponding rows of the whole-file output, and `-@` does not
+  change it. With `-R`, every region equals mHapDMR's `.mscore_streaming`
+  (with all CpGs of the contig) and `mscore_region_stats()` (mHapDMR >= 0.1.1,
+  or older versions with a margin as long as the longest read;
+  `test/check_mscore_regions.R`): the edge cases of
+  `test/regions_mscore.bed` (overlapping, unsorted, no CpG, absent contig)
+  and the 150 DMRs of the ESCC samples. The region modes load CpGs in windows
+  of at least 1 Mb, widened for reads that stick out; a build with 64-bp
+  windows gives the same results (`make test`, and on the ESCC DMRs).
 * Compare with a current wgbs_tools build. In older versions `snp_patter`
   writes out the next read in place of a paired-end read without its mate
   (fixed in 4de9ef5, 2024-11-17) and counts a base matching neither allele as
@@ -318,7 +407,7 @@ pairs the results are identical to wgbs_tools.
   `patter` has no CpG context check (added in 6a018db, 2026-01-22).
 
 ```bash
-make test                  # golden outputs, region modes, threads, index
+make test                  # golden outputs, region modes, threads, index, mHapDMR checks (if installed)
 WGBS_BIN=<dir> make test   # + read-by-read comparison with wgbs_tools (match_maker, snp_patter, patter)
 ```
 
@@ -336,6 +425,9 @@ clips, missing mates) and its truth table.
 | `mhapasm` | BISCUIT PE sample, 2.0M reads, 31.1M SNPs (dbSNP 146 common VCF, 6.4 GB) | 38 s | 1.9 GB |
 | `mhapconvert` | BISCUIT PE sample, 2.0M reads, hg38 | 13.9 s (10.0 s with `-@ 4`) | 61 MB |
 | `mhaptools convert` 0.10 | same | 30.9 s | 293 MB |
+| `mhapmscore` | ESCC WGBS sample, 88.5M mHap records, hg19 (27.4M CpGs written) | 2 min 41 s (1 min 6 s with `-@ 4`; `-w 150`: 2 min 43 s) | 126 MB |
+| `mhapmscore -R` | same sample, 150 DMRs / 100k / 1M regions of 1 kb | 0.4 s / 20 s / 1 min 14 s | 52 MB / 144 MB (100k / 1M) |
+| mHapDMR `mscore_region_stats()` | 150 DMRs, mHap records of the DMRs only | 0.5 s (`mhapmscore -R`: 0.02 s) | |
 
 ## Acknowledgements
 
