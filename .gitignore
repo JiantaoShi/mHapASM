@@ -1,6 +1,8 @@
 # build
 mhapasm
 mhapasm.dSYM/
+mhapconvert
+mhapconvert.dSYM/
 *.o
 
 # test outputs

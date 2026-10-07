@@ -29,10 +29,10 @@
 #include <htslib/tbx.h>
 #include <htslib/kstring.h>
 #include <htslib/khash.h>
+#include "bsread.h"
 
 #define MHAPASM_VERSION "0.1.0"
 
-KHASH_MAP_INIT_STR(pend, void *)
 KHASH_MAP_INIT_STR(name, int)
 
 /* allele call of one read or one fragment at a SNP */
@@ -61,31 +61,6 @@ typedef struct {
 } snp_t;
 
 typedef struct {
-    hts_pos_t beg, end; /* 0-based reference span [beg, end) */
-    int bottom;         /* 1 if the read comes from the bottom (OB/CTOB) strand */
-    char *seq;          /* bases aligned to the reference, 'N' in deletions */
-    uint8_t *qual;      /* base qualities aligned to the reference, 0 in deletions */
-} mate_t;
-
-typedef struct {
-    char *qname;
-    hts_pos_t beg, end; /* union of the mate spans */
-    hts_pos_t mpos;     /* expected mate position while waiting for the mate */
-    int heap_idx;       /* position in the pending-mate heap, -1 if not pending */
-    int nmate;
-    mate_t m[2];
-    int ncall;
-    int32_t *cpg;       /* called CpGs, as ascending indexes into the region CpG array */
-    uint8_t *meth;      /* 1 = methylated, 0 = unmethylated */
-} frag_t;
-
-typedef struct {
-    hts_pos_t *pos;     /* 0-based positions of the CpG C, ascending */
-    uint8_t *mask;      /* 1 if the CpG overlaps a listed SNP */
-    int n, m;
-} cpgs_t;
-
-typedef struct {
     int64_t reads, nsum, n2sum, sjd;
 } acc_t;
 
@@ -98,15 +73,11 @@ typedef struct {
     tbx_t *tbx;
     FILE *out, *qc, *dump;
     bam1_t *b;
-    khash_t(pend) *pend;  /* reads waiting for their mate, by QNAME */
-    frag_t **heap;      /* the same reads as a min-heap on the expected mate position */
-    int nheap, mheap;
+    bs_pairer_t *pairer;
     frag_t **act;       /* finished fragments that may still overlap a pending SNP */
     int nact, mact;
     cpgs_t cpg;
-    int32_t *buf_i[2];  /* scratch buffers for the per-mate CpG calls */
-    uint8_t *buf_m[2];
-    int mbuf;
+    bs_buf_t buf;
     kstring_t ks;
     kstring_t dks;      /* dump lines of the current SNP */
     char **names;       /* contig names of the SNP file */
@@ -120,26 +91,6 @@ typedef struct {
  *                        small helpers                        *
  ***************************************************************/
 
-static void *xmalloc(size_t n)
-{
-    void *p = malloc(n ? n : 1);
-    if (!p) { fprintf(stderr, "[mhapasm] out of memory\n"); exit(1); }
-    return p;
-}
-
-static void *xrealloc(void *p, size_t n)
-{
-    p = realloc(p, n ? n : 1);
-    if (!p) { fprintf(stderr, "[mhapasm] out of memory\n"); exit(1); }
-    return p;
-}
-
-static char *xstrdup(const char *s)
-{
-    size_t n = strlen(s) + 1;
-    return memcpy(xmalloc(n), s, n);
-}
-
 static int is_pair(char a, char b, char x, char y)
 {
     return (a == x && b == y) || (a == y && b == x);
@@ -149,41 +100,6 @@ static int is_acgt(char c)
 {
     return c == 'A' || c == 'C' || c == 'G' || c == 'T';
 }
-
-/* first index i with v[i] >= x */
-static int lower_bound(const hts_pos_t *v, int n, hts_pos_t x)
-{
-    int lo = 0, hi = n;
-    while (lo < hi) {
-        int mid = lo + (hi - lo) / 2;
-        if (v[mid] < x) lo = mid + 1; else hi = mid;
-    }
-    return lo;
-}
-
-/* Look up a contig, accepting a missing or extra "chr" prefix and the usual
- * names of the mitochondrial genome. */
-static int name2id_fallback(int (*lookup)(void *, const char *), void *h, const char *name)
-{
-    static const char *mito[] = {"chrM", "MT", "M", "chrMT"};
-    int id = lookup(h, name);
-    if (id >= 0) return id;
-    for (int i = 0; i < 4; i++) {
-        if (strcmp(name, mito[i])) continue;
-        for (int j = 0; j < 4; j++)
-            if (j != i && (id = lookup(h, mito[j])) >= 0) return id;
-        return -1;
-    }
-    if (!strncmp(name, "chr", 3)) return lookup(h, name + 3);
-    kstring_t ks = {0, 0, NULL};
-    ksprintf(&ks, "chr%s", name);
-    id = lookup(h, ks.s);
-    free(ks.s);
-    return id;
-}
-
-static int bam_lookup(void *h, const char *name) { return sam_hdr_name2tid((sam_hdr_t *) h, name); }
-static int tbx_lookup(void *h, const char *name) { return tbx_name2id((tbx_t *) h, name); }
 
 /***************************************************************
  *                        SNP list                             *
@@ -246,10 +162,10 @@ static int load_snps(ctx_t *c, const char *fn, snp_t **out, int64_t *n_out)
         if (k == kh_end(nh)) {   /* new contig: keep one copy of its name */
             int ret;
             ci = c->nnames++;
-            c->names = xrealloc(c->names, c->nnames * sizeof(char *));
-            name_tid = xrealloc(name_tid, c->nnames * sizeof(int32_t));
-            c->names[ci] = xstrdup(chr);
-            name_tid[ci] = name2id_fallback(bam_lookup, c->hdr, chr);
+            c->names = bs_realloc(c->names, c->nnames * sizeof(char *));
+            name_tid = bs_realloc(name_tid, c->nnames * sizeof(int32_t));
+            c->names[ci] = bs_strdup(chr);
+            name_tid[ci] = bs_bam_tid(c->hdr, chr);
             k = kh_put(name, nh, c->names[ci], &ret);
             kh_val(nh, k) = ci;
         } else {
@@ -262,7 +178,7 @@ static int load_snps(ctx_t *c, const char *fn, snp_t **out, int64_t *n_out)
             if (len != 1 || !is_acgt(t) || t == r) {
                 n_bad++;
             } else {
-                if (n == m) { m = m ? m * 2 : 1024; v = xrealloc(v, m * sizeof(snp_t)); }
+                if (n == m) { m = m ? m * 2 : 1024; v = bs_realloc(v, m * sizeof(snp_t)); }
                 snp_t *s = &v[n];
                 s->chr = ci;
                 s->tid = name_tid[ci];
@@ -297,35 +213,16 @@ static int load_snps(ctx_t *c, const char *fn, snp_t **out, int64_t *n_out)
 /* Load the CpGs of [beg, end) (0-based) from the tabix-indexed CpG file. */
 static int load_cpgs(ctx_t *c, const char *chr, hts_pos_t beg, hts_pos_t end)
 {
-    cpgs_t *g = &c->cpg;
-    g->n = 0;
-    int tid = name2id_fallback(tbx_lookup, c->tbx, chr);
-    if (tid < 0) {
+    int n = bs_cpgs_load(c->cpg_fp, c->tbx, chr, beg, end, &c->cpg, &c->ks);
+    if (n < 0) {
         if (!c->warned_chr || strcmp(c->warned_chr, chr)) {
             fprintf(stderr, "[mhapasm] warning: contig %s is absent from the CpG file; its SNPs get zero counts\n", chr);
             free(c->warned_chr);
-            c->warned_chr = xstrdup(chr);
+            c->warned_chr = bs_strdup(chr);
         }
         return 0;
     }
-    hts_itr_t *itr = tbx_itr_queryi(c->tbx, tid, beg < 0 ? 0 : beg, end);
-    if (!itr) return 0;
-    while (tbx_itr_next(c->cpg_fp, c->tbx, itr, &c->ks) >= 0) {
-        char *p = strchr(c->ks.s, '\t'), *q;
-        if (!p) continue;
-        long long pos = strtoll(p + 1, &q, 10);
-        if (q == p + 1 || pos < 1) continue;
-        if (g->n && pos - 1 <= g->pos[g->n - 1]) continue;  /* duplicates */
-        if (g->n == g->m) {
-            g->m = g->m ? g->m * 2 : 4096;
-            g->pos = xrealloc(g->pos, g->m * sizeof(hts_pos_t));
-            g->mask = xrealloc(g->mask, g->m);
-        }
-        g->pos[g->n] = pos - 1;
-        g->mask[g->n++] = 0;
-    }
-    tbx_itr_destroy(itr);
-    return g->n;
+    return n;
 }
 
 /* Mask CpGs whose C or G sits on a listed SNP, so both alleles are compared
@@ -333,7 +230,7 @@ static int load_cpgs(ctx_t *c, const char *chr, hts_pos_t beg, hts_pos_t end)
 static void mask_snp_cpgs(cpgs_t *g, const snp_t *s, int64_t ns)
 {
     for (int64_t k = 0; k < ns; k++) {
-        int i = lower_bound(g->pos, g->n, s[k].pos0 - 1);
+        int i = bs_lower_bound(g->pos, g->n, s[k].pos0 - 1);
         for (; i < g->n && g->pos[i] <= s[k].pos0; i++) g->mask[i] = 1;
     }
 }
@@ -342,275 +239,26 @@ static void mask_snp_cpgs(cpgs_t *g, const snp_t *s, int64_t ns)
  *                        reads and fragments                  *
  ***************************************************************/
 
-/* Bisulfite strand of a read. Strand tags written by the aligner win
- * (Bismark XG, bwa-meth/BISCUIT YD, BSMAP ZS). Otherwise use the wgbs_tools
- * is_bottom rule (OB = read1 reverse / read2 forward), without requiring the
- * proper-pair bit. */
-static int read_is_bottom(const bam1_t *b)
+/* A fragment is complete: call its CpGs and make it available to the SNP
+ * evaluation. */
+static void frag_done(frag_t *f, void *data)
 {
-    uint8_t *t;
-    if ((t = bam_aux_get(b, "XG")) && *t == 'Z') {
-        const char *v = bam_aux2Z(t);
-        if (v && !strcmp(v, "GA")) return 1;
-        if (v && !strcmp(v, "CT")) return 0;
-    }
-    if ((t = bam_aux_get(b, "YD"))) {
-        char v = 0;
-        if (*t == 'A') v = bam_aux2A(t);
-        else if (*t == 'Z') { const char *z = bam_aux2Z(t); v = z ? z[0] : 0; }
-        if (v == 'r' || v == 'R') return 1;
-        if (v == 'f' || v == 'F') return 0;
-    }
-    if ((t = bam_aux_get(b, "ZS")) && *t == 'Z') {
-        const char *v = bam_aux2Z(t);
-        if (v && v[0] == '-') return 1;
-        if (v && v[0] == '+') return 0;
-    }
-    uint16_t fl = b->core.flag;
-    if (fl & BAM_FPAIRED) {
-        if (fl & BAM_FREAD1) return (fl & BAM_FREVERSE) != 0;
-        if (fl & BAM_FREAD2) return (fl & BAM_FREVERSE) == 0;
-    }
-    return (fl & BAM_FREVERSE) != 0;
-}
-
-/* Lay the read out on the reference (patter_utils::clean_CIGAR): keep M/=/X,
- * drop I/S/H/P, fill D/N with 'N'. */
-static int mate_init(mate_t *m, const bam1_t *b)
-{
-    const uint32_t *cig = bam_get_cigar(b);
-    int ncig = b->core.n_cigar;
-    hts_pos_t rlen = bam_cigar2rlen(ncig, cig);
-    if (rlen <= 0) return -1;
-    m->beg = b->core.pos;
-    m->end = b->core.pos + rlen;
-    m->bottom = read_is_bottom(b);
-    m->seq = xmalloc(rlen);
-    m->qual = xmalloc(rlen);
-    const uint8_t *s = bam_get_seq(b), *q = bam_get_qual(b);
-    hts_pos_t r = 0;
-    int32_t qi = 0;
-    for (int i = 0; i < ncig; i++) {
-        int op = bam_cigar_op(cig[i]);
-        int32_t len = bam_cigar_oplen(cig[i]);
-        if (op == BAM_CMATCH || op == BAM_CEQUAL || op == BAM_CDIFF) {
-            for (int32_t j = 0; j < len; j++, r++, qi++) {
-                m->seq[r] = seq_nt16_str[bam_seqi(s, qi)];
-                m->qual[r] = q[qi];
-            }
-        } else if (op == BAM_CDEL || op == BAM_CREF_SKIP) {
-            memset(m->seq + r, 'N', len);
-            memset(m->qual + r, 0, len);
-            r += len;
-        } else if (op == BAM_CINS || op == BAM_CSOFT_CLIP) {
-            qi += len;
-        }
-    }
-    return 0;
-}
-
-static frag_t *frag_new(const bam1_t *b, const mate_t *m)
-{
-    frag_t *f = xmalloc(sizeof(frag_t));
-    memset(f, 0, sizeof(frag_t));
-    f->qname = xstrdup(bam_get_qname(b));
-    f->m[0] = *m;
-    f->nmate = 1;
-    return f;
-}
-
-static void frag_free(frag_t *f)
-{
-    for (int i = 0; i < f->nmate; i++) { free(f->m[i].seq); free(f->m[i].qual); }
-    free(f->cpg);
-    free(f->meth);
-    free(f->qname);
-    free(f);
-}
-
-/* CpG calls of one read (patter::compareSeqToRef). The whole CpG must lie in
- * the aligned span and the read must show the CpG context itself: C/T + G on
- * the top strand, C + G/A on the bottom strand. Only informative calls are
- * returned. */
-static int mate_calls(const mate_t *m, const cpgs_t *g, int min_bq, int32_t *idx, uint8_t *st)
-{
-    int n = 0;
-    for (int i = lower_bound(g->pos, g->n, m->beg); i < g->n && g->pos[i] + 1 < m->end; i++) {
-        if (g->mask[i]) continue;
-        hts_pos_t c = g->pos[i] - m->beg;
-        char base, ctx;
-        uint8_t q;
-        if (!m->bottom) { base = m->seq[c]; ctx = m->seq[c + 1]; q = m->qual[c]; }
-        else            { base = m->seq[c + 1]; ctx = m->seq[c]; q = m->qual[c + 1]; }
-        if (q < min_bq) continue;
-        int s = -1;
-        if (!m->bottom) { if (ctx == 'G') s = base == 'C' ? 1 : base == 'T' ? 0 : -1; }
-        else            { if (ctx == 'C') s = base == 'G' ? 1 : base == 'A' ? 0 : -1; }
-        if (s < 0) continue;
-        idx[n] = i;
-        st[n++] = (uint8_t) s;
-    }
-    return n;
-}
-
-static void grow_buffers(ctx_t *c, int need)
-{
-    if (need <= c->mbuf) return;
-    c->mbuf = need * 2;
-    for (int k = 0; k < 2; k++) {
-        c->buf_i[k] = xrealloc(c->buf_i[k], c->mbuf * sizeof(int32_t));
-        c->buf_m[k] = xrealloc(c->buf_m[k], c->mbuf);
-    }
-}
-
-/* Upper bound on the number of CpGs inside [beg, end). */
-static int cpgs_in_span(const cpgs_t *g, hts_pos_t beg, hts_pos_t end)
-{
-    return lower_bound(g->pos, g->n, end) - lower_bound(g->pos, g->n, beg);
-}
-
-/* Fragment is complete: merge the CpG calls of its mates (merge_PE: a CpG
- * seen by one mate is kept, a CpG on which the mates disagree is dropped) and
- * make it available to the SNP evaluation. */
-static void frag_finish(ctx_t *c, frag_t *f)
-{
-    f->beg = f->m[0].beg;
-    f->end = f->m[0].end;
-    int n[2] = {0, 0};
-    for (int k = 0; k < f->nmate; k++) {
-        if (f->m[k].beg < f->beg) f->beg = f->m[k].beg;
-        if (f->m[k].end > f->end) f->end = f->m[k].end;
-        grow_buffers(c, cpgs_in_span(&c->cpg, f->m[k].beg, f->m[k].end) + 1);
-        n[k] = mate_calls(&f->m[k], &c->cpg, c->o->min_cpg_bq, c->buf_i[k], c->buf_m[k]);
-    }
-    int tot = n[0] + n[1];
-    f->cpg = xmalloc(tot * sizeof(int32_t));
-    f->meth = xmalloc(tot);
-    int i = 0, j = 0, k = 0;
-    while (i < n[0] || j < n[1]) {
-        if (j >= n[1] || (i < n[0] && c->buf_i[0][i] < c->buf_i[1][j])) {
-            f->cpg[k] = c->buf_i[0][i]; f->meth[k++] = c->buf_m[0][i++];
-        } else if (i >= n[0] || c->buf_i[1][j] < c->buf_i[0][i]) {
-            f->cpg[k] = c->buf_i[1][j]; f->meth[k++] = c->buf_m[1][j++];
-        } else {
-            if (c->buf_m[0][i] == c->buf_m[1][j]) { f->cpg[k] = c->buf_i[0][i]; f->meth[k++] = c->buf_m[0][i]; }
-            i++; j++;
-        }
-    }
-    f->ncall = k;
+    ctx_t *c = data;
+    bs_frag_call(f, &c->cpg, c->o->min_cpg_bq, &c->buf);
     if (c->nact == c->mact) {
         c->mact = c->mact ? c->mact * 2 : 256;
-        c->act = xrealloc(c->act, c->mact * sizeof(frag_t *));
+        c->act = bs_realloc(c->act, c->mact * sizeof(frag_t *));
     }
     c->act[c->nact++] = f;
     c->n_frags++;
 }
 
-/* Reads waiting for their mate are kept in a hash (by QNAME) and in a
- * min-heap on the expected mate position, so that reads whose mate never
- * shows up are found without scanning the hash. */
-static void heap_swap(ctx_t *c, int i, int j)
-{
-    frag_t *t = c->heap[i];
-    c->heap[i] = c->heap[j];
-    c->heap[j] = t;
-    c->heap[i]->heap_idx = i;
-    c->heap[j]->heap_idx = j;
-}
-
-static void heap_up(ctx_t *c, int i)
-{
-    while (i > 0 && c->heap[(i - 1) / 2]->mpos > c->heap[i]->mpos) {
-        heap_swap(c, i, (i - 1) / 2);
-        i = (i - 1) / 2;
-    }
-}
-
-static void heap_down(ctx_t *c, int i)
-{
-    for (;;) {
-        int l = 2 * i + 1, r = l + 1, m = i;
-        if (l < c->nheap && c->heap[l]->mpos < c->heap[m]->mpos) m = l;
-        if (r < c->nheap && c->heap[r]->mpos < c->heap[m]->mpos) m = r;
-        if (m == i) return;
-        heap_swap(c, i, m);
-        i = m;
-    }
-}
-
-static void heap_push(ctx_t *c, frag_t *f)
-{
-    if (c->nheap == c->mheap) {
-        c->mheap = c->mheap ? c->mheap * 2 : 256;
-        c->heap = xrealloc(c->heap, c->mheap * sizeof(frag_t *));
-    }
-    c->heap[c->nheap] = f;
-    f->heap_idx = c->nheap++;
-    heap_up(c, f->heap_idx);
-}
-
-static void heap_remove(ctx_t *c, frag_t *f)
-{
-    int i = f->heap_idx;
-    if (i != --c->nheap) {
-        c->heap[i] = c->heap[c->nheap];
-        c->heap[i]->heap_idx = i;
-        heap_down(c, i);
-        heap_up(c, i);
-    }
-    f->heap_idx = -1;
-}
-
-/* Add a filtered read: pair it with its mate (by QNAME) or keep it as a
- * single-read fragment, like wgbs_tools match_maker. */
 static void add_read(ctx_t *c, const bam1_t *b)
 {
-    const bam1_core_t *co = &b->core;
     mate_t m;
-    if (mate_init(&m, b) < 0) return;
+    if (bs_mate_init(&m, b) < 0) return;
     c->n_reads++;
-    int expect = (co->flag & BAM_FPAIRED) && !(co->flag & BAM_FMUNMAP) && co->mtid == co->tid
-                 && llabs((long long) (co->mpos - co->pos)) <= c->o->max_frag;
-    if (expect) {
-        khint_t k = kh_get(pend, c->pend, bam_get_qname(b));
-        if (k != kh_end(c->pend)) {
-            frag_t *f = kh_val(c->pend, k);
-            kh_del(pend, c->pend, k);
-            heap_remove(c, f);
-            f->m[f->nmate++] = m;
-            frag_finish(c, f);
-            return;
-        }
-        if (co->mpos >= co->pos) {   /* mate still to come */
-            frag_t *f = frag_new(b, &m);
-            f->mpos = co->mpos;
-            int ret;
-            k = kh_put(pend, c->pend, f->qname, &ret);
-            if (ret == 0) {          /* same QNAME already waiting: keep both as singles */
-                frag_t *old = kh_val(c->pend, k);
-                kh_key(c->pend, k) = f->qname;
-                heap_remove(c, old);
-                frag_finish(c, old);
-            }
-            kh_val(c->pend, k) = f;
-            heap_push(c, f);
-            return;
-        }
-    }
-    frag_finish(c, frag_new(b, &m));
-}
-
-/* Reads whose mate was expected before position `pos` but never came (e.g.
- * the mate failed the filters) become single-read fragments. */
-static void flush_pending(ctx_t *c, hts_pos_t pos)
-{
-    while (c->nheap && c->heap[0]->mpos < pos) {
-        frag_t *f = c->heap[0];
-        heap_remove(c, f);
-        khint_t k = kh_get(pend, c->pend, f->qname);
-        if (k != kh_end(c->pend)) kh_del(pend, c->pend, k);
-        frag_finish(c, f);
-    }
+    bs_pairer_add(c->pairer, b, &m);
 }
 
 /* Drop fragments that end before `pos`; no later SNP can use them. */
@@ -618,7 +266,7 @@ static void evict(ctx_t *c, hts_pos_t pos)
 {
     int j = 0;
     for (int i = 0; i < c->nact; i++) {
-        if (c->act[i]->end <= pos) frag_free(c->act[i]);
+        if (c->act[i]->end <= pos) bs_frag_free(c->act[i]);
         else c->act[j++] = c->act[i];
     }
     c->nact = j;
@@ -778,7 +426,7 @@ static int process_region(ctx_t *c, int tid, hts_pos_t rbeg, hts_pos_t rend, con
     while ((ret = sam_itr_next(c->fp, itr, c->b)) >= 0) {
         hts_pos_t pos = c->b->core.pos;
         if (s[k].pos0 + L < pos) {
-            flush_pending(c, pos);
+            bs_pairer_flush(c->pairer, pos);
             while (k < ns && s[k].pos0 + L < pos) {
                 eval_snp(c, &s[k]);
                 k++;
@@ -790,7 +438,7 @@ static int process_region(ctx_t *c, int tid, hts_pos_t rbeg, hts_pos_t rend, con
     }
     hts_itr_destroy(itr);
     if (ret < -1) { fprintf(stderr, "[mhapasm] error reading %s\n", o->bam_fn); return -1; }
-    flush_pending(c, HTS_POS_MAX);
+    bs_pairer_flush(c->pairer, HTS_POS_MAX);
     for (; k < ns; k++) eval_snp(c, &s[k]);
     evict(c, HTS_POS_MAX);
     return 0;
@@ -892,6 +540,7 @@ int main(int argc, char **argv)
     if (!o.bam_fn || !o.cpg_fn || !o.snp_fn || optind != argc) { usage(stderr); return 1; }
     if (o.max_frag < 1 || o.window < 0) { fprintf(stderr, "[mhapasm] -L must be >= 1 and -w >= 0\n"); return 1; }
 
+    bs_prog = "mhapasm";
     clock_t t0 = clock();
     ctx_t c;
     memset(&c, 0, sizeof(c));
@@ -908,7 +557,7 @@ int main(int argc, char **argv)
     if (o.qc_fn && !(c.qc = fopen(o.qc_fn, "w"))) { fprintf(stderr, "[mhapasm] cannot write %s\n", o.qc_fn); return 1; }
     if (o.dump_fn && !(c.dump = fopen(o.dump_fn, "w"))) { fprintf(stderr, "[mhapasm] cannot write %s\n", o.dump_fn); return 1; }
     c.b = bam_init1();
-    c.pend = kh_init(pend);
+    c.pairer = bs_pairer_init(o.max_frag, frag_done, &c);
 
     int64_t ns = 0;
     snp_t *s = NULL;
@@ -947,13 +596,12 @@ int main(int argc, char **argv)
     for (int k = 0; k < c.nnames; k++) free(c.names[k]);
     free(c.names);
     free(s);
-    free(c.heap);
     free(c.dks.s);
-    kh_destroy(pend, c.pend);
+    bs_pairer_destroy(c.pairer);
     free(c.act);
     free(c.cpg.pos);
     free(c.cpg.mask);
-    for (int k = 0; k < 2; k++) { free(c.buf_i[k]); free(c.buf_m[k]); }
+    bs_buf_free(&c.buf);
     free(c.ks.s);
     free(c.warned_chr);
     bam_destroy1(c.b);

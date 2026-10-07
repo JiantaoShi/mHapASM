@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Simulate a small directional paired-end bisulfite BAM for testing mhapasm.
+Simulate a small bisulfite sequencing BAM for testing mhapasm and mhapconvert.
 
 A random reference contig carries phased heterozygous SNPs (REF alleles on
 haplotype 0, ALT alleles on haplotype 1, some of them CpG-destroying C>T / G>A).
@@ -8,15 +8,21 @@ Fragments are drawn from either haplotype, methylated with allele-specific
 probabilities, bisulfite converted on the original top (OT) or bottom (OB)
 strand, and sequenced as read pairs with the directional flags 99/147 (OT) and
 83/163 (OB). Sequencing errors, soft clips, insertions, deletions, low MAPQ,
-duplicates and missing mates are mixed in.
+duplicates and missing mates are mixed in. Options add single-end reads,
+the strand tags of an aligner, and non-directional (CTOT/CTOB) fragments,
+whose flags look like OB/OT although they carry the OT/OB conversion. Without
+these options the output is the same as before they existed.
 
 Writes into --out-dir:
   sim.bam(.bai)       coordinate-sorted, indexed
   cpg.gz(.tbi)        chr, 1-based C position, 1-based G position (tabix -s1 -b2 -e3)
   snps.txt            chr pos ref alt
   truth.tsv           qname, haplotype, strand, fragment start/end (1-based)
+  --meth-truth FILE   qname, then pos:state for every reference CpG of the
+                      fragment (1 / 0, x if the haplotype has no CpG there)
 """
 import argparse
+import bisect
 import os
 import random
 import subprocess
@@ -36,6 +42,14 @@ def main():
     ap.add_argument("--length", type=int, default=20000)
     ap.add_argument("--n-frag", type=int, default=8000)
     ap.add_argument("--n-snp", type=int, default=40)
+    ap.add_argument("--se", action="store_true", help="single-end reads")
+    ap.add_argument("--aligner", choices=["none", "bismark", "bwameth", "biscuit", "bsmap"], default="none",
+                    help="strand tags to write: XG (Bismark), YD:Z (bwa-meth), YD:A (BISCUIT), ZS (BSMAP)")
+    ap.add_argument("--non-directional", type=float, default=0.0,
+                    help="fraction of fragments read from the complementary strands (CTOT/CTOB)")
+    ap.add_argument("--unconverted", type=float, default=0.0,
+                    help="fraction of fragments left unconverted by bisulfite (they look fully methylated)")
+    ap.add_argument("--meth-truth", help="write the true CpG states of every fragment")
     a = ap.parse_args()
     rnd = random.Random(a.seed)
     os.makedirs(a.out_dir, exist_ok=True)
@@ -86,6 +100,7 @@ def main():
     truth = open(os.path.join(a.out_dir, "truth.tsv"), "w")
     truth.write("qname\thap\tstrand\tstart\tend\n")
     sam = open(sam_path, "w")
+    mtruth = open(a.meth_truth, "w") if a.meth_truth else None
     sam.write(f"@HD\tVN:1.6\tSO:unsorted\n@SQ\tSN:{chrom}\tLN:{L}\n")
 
     def qual_str(n):
@@ -132,21 +147,31 @@ def main():
         # bisulfite-converted fragment in reference orientation, offset fs
         # (a few extra bases so that a deletion near the end stays in range)
         seg_end = min(L, fe + 5)
+        unconv = a.unconverted > 0 and rnd.random() < a.unconverted
         conv = list(hs[fs:seg_end])
+        state = {}                          # CpG C position -> drawn methylation
         for j in range(fs, seg_end):
             if not bottom and hs[j] == "C":
                 meth = j + 1 < L and hs[j + 1] == "G" and rnd.random() < meth_prob(h, j, frag_state)
-                conv[j - fs] = "C" if meth else "T"
+                conv[j - fs] = "C" if meth or unconv else "T"
+                if j + 1 < L and hs[j + 1] == "G":
+                    state[j] = meth
             elif bottom and hs[j] == "G":
                 meth = j > 0 and hs[j - 1] == "C" and rnd.random() < meth_prob(h, j - 1, frag_state)
-                conv[j - fs] = "G" if meth else "A"
+                conv[j - fs] = "G" if meth or unconv else "A"
+                if j > 0 and hs[j - 1] == "C":
+                    state[j - 1] = meth
         conv = "".join(conv)
         rl = 150 if rnd.random() < 0.3 else 100
         rl = min(rl, flen)
         qname = f"frag{i}"
         dup = rnd.random() < 0.02
+        # complementary strands (non-directional libraries): same conversion,
+        # read 1 from the other end of the fragment
+        comp = a.non_directional > 0 and rnd.random() < a.non_directional
         mates = []
-        for side in ("L", "R"):
+        sides = ("L", "R") if not a.se else (("R",) if bottom != comp else ("L",))
+        for side in sides:
             kind = rnd.choices(["plain", "del", "ins", "sclip5", "sclip3"], weights=(85, 4, 4, 3.5, 3.5))[0]
             if kind in ("del", "ins") and (rl < 60 or rl + 3 > flen):
                 kind = "plain"
@@ -158,23 +183,44 @@ def main():
             seq = "".join(rnd.choice([b for b in "ACGT" if b != x]) if rnd.random() < 0.005 else x for x in seq)
             cig = "".join(f"{ln}{op}" for op, ln in ops)
             mates.append([pos, cig, seq, qual_str(len(seq))])
-        # directional library: OT = read1 forward on the left; OB = read1 reverse on the right
-        (lp, lc, ls, lq), (rp, rc, rs, rq) = mates
-        if not bottom:
-            recs = [(99, lp, lc, ls, lq, rp, 1), (147, rp, rc, rs, rq, lp, -1)]
+        # directional library: OT = read1 forward on the left; OB = read1 reverse
+        # on the right. CTOT/CTOB swap the ends, so their flags look like OB/OT.
+        if a.se:
+            (p1, c1, s1, q1), = mates
+            recs = [(16 if bottom != comp else 0, p1, c1, s1, q1, -1, 0)]
         else:
-            recs = [(163, lp, lc, ls, lq, rp, 1), (83, rp, rc, rs, rq, lp, -1)]
-        drop = rnd.random() < 0.03          # one mate missing from the BAM
-        if drop:
-            recs = [recs[rnd.randint(0, 1)]]
+            (lp, lc, ls, lq), (rp, rc, rs, rq) = mates
+            if bottom == comp:
+                recs = [(99, lp, lc, ls, lq, rp, 1), (147, rp, rc, rs, rq, lp, -1)]
+            else:
+                recs = [(163, lp, lc, ls, lq, rp, 1), (83, rp, rc, rs, rq, lp, -1)]
+            drop = rnd.random() < 0.03      # one mate missing from the BAM
+            if drop:
+                recs = [recs[rnd.randint(0, 1)]]
         for flag, pos, cig, seq, qual, mpos, sign in recs:
             mapq = 3 if rnd.random() < 0.03 else 60
             if dup:
                 flag |= 0x400
-            sam.write(f"{qname}\t{flag}\t{chrom}\t{pos + 1}\t{mapq}\t{cig}\t=\t{mpos + 1}\t{sign * flen}\t{seq}\t{qual}\n")
+            tags = ""
+            if a.aligner == "bismark":
+                tags = "\tXG:Z:" + ("GA" if bottom else "CT")
+            elif a.aligner == "bwameth":
+                tags = "\tYD:Z:" + ("r" if bottom else "f")
+            elif a.aligner == "biscuit":
+                tags = "\tYD:A:" + ("r" if bottom else "f")
+            elif a.aligner == "bsmap":
+                tags = "\tZS:Z:" + ("-" if bottom else "+") + ("-" if flag & 16 else "+")
+            mate = f"=\t{mpos + 1}\t{sign * flen}" if not a.se else "*\t0\t0"
+            sam.write(f"{qname}\t{flag}\t{chrom}\t{pos + 1}\t{mapq}\t{cig}\t{mate}\t{seq}\t{qual}{tags}\n")
             n += 1
         truth.write(f"{qname}\t{h}\t{'-' if bottom else '+'}\t{fs + 1}\t{fe}\n")
+        if mtruth:
+            cs = cpgs[bisect.bisect_left(cpgs, fs - 1):bisect.bisect_left(cpgs, fe)]
+            mtruth.write(qname + "\t" + ",".join(
+                f"{c + 1}:{'x' if c not in state else int(state[c])}" for c in cs) + "\n")
     sam.close()
+    if mtruth:
+        mtruth.close()
     truth.close()
     bam = os.path.join(a.out_dir, "sim.bam")
     subprocess.run(f"samtools sort -o {bam} {sam_path} 2>/dev/null && samtools index {bam}", shell=True, check=True)

@@ -1,5 +1,5 @@
 #!/bin/bash
-# Regression and cross-validation tests for mhapasm.
+# Regression and cross-validation tests for mhapasm and mhapconvert.
 #
 #   bash test/run_tests.sh                        # golden outputs + thread determinism
 #   WGBS_BIN=<dir> bash test/run_tests.sh         # + read-by-read comparison with wgbs_tools
@@ -36,7 +36,19 @@ golden() {  # name, expected file, mhapasm args...
     fi
 }
 
-[ -x "$EXE" ] || { echo "build mhapasm first (make)"; exit 1; }
+# golden test of mhapconvert: name, expected file, mhapconvert args...
+golden_cvt() {
+    local name=$1 expected=$2; shift 2
+    if ./mhapconvert "$@" -o "$OUT/$name.mhap" > "$OUT/$name.log" 2>&1 &&
+       diff "$expected" "$OUT/$name.mhap" >> "$OUT/$name.log" 2>&1; then
+        echo "PASS  $name"
+    else
+        echo "FAIL  $name (see $OUT/$name.log)"
+        fail=1
+    fi
+}
+
+[ -x "$EXE" ] && [ -x ./mhapconvert ] || { echo "build first (make)"; exit 1; }
 
 IGF2_BAM=${IGF2_BAM:-test/data/Left_Ventricle_STL001.IGF2.bam}
 HG19_CPG=${HG19_CPG:-test/data/hg19_CpG.IGF2.gz}
@@ -55,7 +67,27 @@ check sim_qc diff test/expected/sim.qc.tsv "$OUT/sim.qc.tsv"
 golden sim_w100 test/expected/sim.w100.tsv "${SIM[@]}" -w 100
 golden sim_threads test/expected/sim.tsv "${SIM[@]}" -@ 2
 
+# mhapconvert
+SIMC=(-i test/sim/sim.bam -c test/sim/cpg.gz)
+if [ -f "$IGF2_BAM" ] && [ -f "$HG19_CPG" ]; then
+    golden_cvt convert_igf2 test/expected/convert_igf2.mhap -i "$IGF2_BAM" -c "$HG19_CPG"
+fi
+golden_cvt convert_sim test/expected/convert_sim.mhap "${SIMC[@]}"
+golden_cvt convert_sim_split test/expected/convert_sim.split.mhap "${SIMC[@]}" --split
+golden_cvt convert_sim_nondir test/expected/convert_sim.nondir.mhap "${SIMC[@]}" -n
+golden_cvt convert_sim_taps test/expected/convert_sim.taps.mhap "${SIMC[@]}" -m TAPS
+golden_cvt convert_sim_bed test/expected/convert_sim.bed.mhap "${SIMC[@]}" -b test/regions.bed
+golden_cvt convert_sim_threads test/expected/convert_sim.mhap "${SIMC[@]}" -@ 2
+check convert_sim_index bash -c './mhapconvert -i test/sim/sim.bam -c test/sim/cpg.gz -o test/out/convert_sim.mhap.gz &&
+    cmp <(tabix test/out/convert_sim.mhap.gz chrS) test/expected/convert_sim.mhap'
+
 if [ -n "${WGBS_BIN:-}" ]; then
+    check wgbs_convert_sim python3 test/validate_convert.py --bam test/sim/sim.bam --cpg test/sim/cpg.gz \
+        --wgbs-bin "$WGBS_BIN" --region chrS:1-20000
+    if [ -f "$IGF2_BAM" ] && [ -f "$HG19_CPG" ]; then
+        check wgbs_convert_igf2 python3 test/validate_convert.py --bam "$IGF2_BAM" --cpg "$HG19_CPG" \
+            --wgbs-bin "$WGBS_BIN" --region chr11:2000000-2050000
+    fi
     check wgbs_sim python3 test/validate_vs_wgbs.py --bam test/sim/sim.bam --cpg test/sim/cpg.gz \
         --wgbs-bin "$WGBS_BIN" --mhapasm "$EXE" --region chrS:1500-18500 --n-pos 10 --snp-file test/sim/snps.txt
     if [ -f "$IGF2_BAM" ] && [ -f "$HG19_CPG" ]; then
